@@ -4,6 +4,7 @@ import os
 import time
 import threading
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List
 
 import numpy as np
@@ -28,9 +29,7 @@ CACHE_INTRADAY_TTL_SEC = int(os.environ.get("CACHE_INTRADAY_TTL_SEC", "120"))
 LEVELS_FETCH_DAYS = int(os.environ.get("LEVELS_FETCH_DAYS", "210"))
 LEVELS_THREADS = int(os.environ.get("LEVELS_THREADS", "12"))
 MAX_TIMING_SYMBOLS = int(os.environ.get("MAX_TIMING_SYMBOLS", "120"))
-LEVELS_MAX_SYMBOLS = int(os.environ.get("LEVELS_MAX_SYMBOLS", "250"))
-RATE_LIMIT_REQ_PER_SEC = float(os.environ.get("RATE_LIMIT_REQ_PER_SEC", "12"))
-MIN_REFRESH_WITH_TIMES_SEC = int(os.environ.get("MIN_REFRESH_WITH_TIMES_SEC", "15"))
+RATE_LIMIT_REQ_PER_SEC = float(os.environ.get("RATE_LIMIT_REQ_PER_SEC", "8"))
 
 QUOTE_ASSETS_ENV = os.environ.get("QUOTE_ASSETS", "").strip()
 MIN_QUOTE_VOL_24H_ENV = float(os.environ.get("MIN_QUOTE_VOL_24H", "0"))
@@ -84,10 +83,7 @@ def fapi_get(
 ):
     global _LAST_HTTP_REQ_AT
     if timeout is None:
-        if threading.current_thread() is threading.main_thread():
-            timeout = int(st.session_state.get("http_timeout", HTTP_TIMEOUT))
-        else:
-            timeout = HTTP_TIMEOUT
+        timeout = int(st.session_state.get("http_timeout", HTTP_TIMEOUT))
     else:
         timeout = int(timeout)
 
@@ -231,15 +227,15 @@ def fetch_klines_intraday_cached(base_url: str, symbol: str, interval: str, star
 @st.cache_data(ttl=CACHE_LEVELS_TTL_SEC, show_spinner=False)
 def compute_levels_all(base_url: str, symbols: List[str], fetch_days: int, threads: int) -> pd.DataFrame:
     out_rows = []
+    threads = max(1, int(threads))
 
-    for sym in symbols:
+    def worker(sym: str):
         df = fetch_klines_1d(base_url, sym, limit=max(fetch_days, 182))
         if df is None or df.empty:
-            continue
-
+            return None
         df2 = df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
         if len(df2) < 10:
-            continue
+            return None
 
         h90 = l90 = h180 = l180 = np.nan
         if len(df2) >= 90:
@@ -251,14 +247,14 @@ def compute_levels_all(base_url: str, symbols: List[str], fetch_days: int, threa
             h180 = float(np.max(w["high"].values))
             l180 = float(np.min(w["low"].values))
 
-        out_rows.append({
-            "symbol": sym,
-            "high_90": h90,
-            "low_90": l90,
-            "high_180": h180,
-            "low_180": l180,
-            "hist_days": int(len(df2)),
-        })
+        return {"symbol": sym, "high_90": h90, "low_90": l90, "high_180": h180, "low_180": l180, "hist_days": int(len(df2))}
+
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = {ex.submit(worker, s): s for s in symbols}
+        for fut in as_completed(futs):
+            row = fut.result()
+            if row:
+                out_rows.append(row)
 
     df_out = pd.DataFrame(out_rows, columns=["symbol", "high_90", "low_90", "high_180", "low_180", "hist_days"])
     return df_out.sort_values("symbol").reset_index(drop=True) if not df_out.empty else df_out
@@ -444,17 +440,9 @@ with st.sidebar:
     )
     intraday_lookback = st.slider("Intraday lookback (hours)", min_value=24, max_value=720, value=int(BREAKOUT_TIME_LOOKBACK_HOURS), step=24)
 
-effective_refresh_seconds = int(refresh_seconds)
-if show_times and effective_refresh_seconds < MIN_REFRESH_WITH_TIMES_SEC:
-    effective_refresh_seconds = MIN_REFRESH_WITH_TIMES_SEC
-    st.info(
-        f"Auto refresh increased to {effective_refresh_seconds}s while breakout timestamps are enabled "
-        "to prevent endless reruns before intraday computation finishes."
-    )
-
 try:
     from streamlit_autorefresh import st_autorefresh  # type: ignore
-    st_autorefresh(interval=effective_refresh_seconds * 1000, key="auto_refresh")
+    st_autorefresh(interval=int(refresh_seconds) * 1000, key="auto_refresh")
 except Exception:
     pass
 
@@ -500,14 +488,6 @@ if min_qv > 0:
     snap = snap[(snap["quoteVolume"].fillna(0) >= min_qv)].copy()
 
 symbols = snap["symbol"].tolist()
-
-if LEVELS_MAX_SYMBOLS > 0 and len(symbols) > LEVELS_MAX_SYMBOLS:
-    st.warning(
-        f"Universe capped to top {LEVELS_MAX_SYMBOLS} symbols by 24h quote volume for level computation/performance. "
-        f"Increase LEVELS_MAX_SYMBOLS to scan more symbols."
-    )
-    snap = snap.sort_values(["quoteVolume", "symbol"], ascending=[False, True]).head(LEVELS_MAX_SYMBOLS).copy()
-    symbols = snap["symbol"].tolist()
 
 if snap.empty:
     st.warning("No symbols matched the current filters (quote assets / volume), or Binance returned an empty snapshot.")
