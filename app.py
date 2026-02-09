@@ -4,6 +4,7 @@ import os
 import time
 import threading
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List
 
 import numpy as np
@@ -18,7 +19,7 @@ except Exception:
     pass
 
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
-REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "0"))
+REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "5"))
 
 CACHE_LEVELS_TTL_SEC = int(os.environ.get("CACHE_LEVELS_TTL_SEC", "21600"))
 CACHE_SNAPSHOT_TTL_SEC = int(os.environ.get("CACHE_SNAPSHOT_TTL_SEC", "5"))
@@ -26,14 +27,9 @@ CACHE_SYMBOLS_TTL_SEC = int(os.environ.get("CACHE_SYMBOLS_TTL_SEC", "86400"))
 CACHE_INTRADAY_TTL_SEC = int(os.environ.get("CACHE_INTRADAY_TTL_SEC", "120"))
 
 LEVELS_FETCH_DAYS = int(os.environ.get("LEVELS_FETCH_DAYS", "210"))
-LEVELS_THREADS = int(os.environ.get("LEVELS_THREADS", "4"))
-MAX_TIMING_SYMBOLS = int(os.environ.get("MAX_TIMING_SYMBOLS", "20"))
-LEVELS_MAX_SYMBOLS = int(os.environ.get("LEVELS_MAX_SYMBOLS", "30"))
-MAX_LEVELS_RUNTIME_SEC = int(os.environ.get("MAX_LEVELS_RUNTIME_SEC", "12"))
-KLINES_TIMEOUT_SEC = int(os.environ.get("KLINES_TIMEOUT_SEC", "4"))
-KLINES_RETRIES = int(os.environ.get("KLINES_RETRIES", "1"))
-RATE_LIMIT_REQ_PER_SEC = float(os.environ.get("RATE_LIMIT_REQ_PER_SEC", "16"))
-MIN_REFRESH_WITH_TIMES_SEC = int(os.environ.get("MIN_REFRESH_WITH_TIMES_SEC", "20"))
+LEVELS_THREADS = int(os.environ.get("LEVELS_THREADS", "12"))
+MAX_TIMING_SYMBOLS = int(os.environ.get("MAX_TIMING_SYMBOLS", "120"))
+RATE_LIMIT_REQ_PER_SEC = float(os.environ.get("RATE_LIMIT_REQ_PER_SEC", "8"))
 
 QUOTE_ASSETS_ENV = os.environ.get("QUOTE_ASSETS", "").strip()
 MIN_QUOTE_VOL_24H_ENV = float(os.environ.get("MIN_QUOTE_VOL_24H", "0"))
@@ -87,10 +83,7 @@ def fapi_get(
 ):
     global _LAST_HTTP_REQ_AT
     if timeout is None:
-        if threading.current_thread() is threading.main_thread():
-            timeout = int(st.session_state.get("http_timeout", HTTP_TIMEOUT))
-        else:
-            timeout = HTTP_TIMEOUT
+        timeout = int(st.session_state.get("http_timeout", HTTP_TIMEOUT))
     else:
         timeout = int(timeout)
 
@@ -202,7 +195,7 @@ def get_snapshot_last_24h(base_url: str) -> pd.DataFrame:
 
 def fetch_klines_1d(base_url: str, symbol: str, limit: int) -> Optional[pd.DataFrame]:
     try:
-        data = fapi_get(base_url, "/fapi/v1/klines", params={"symbol": symbol, "interval": "1d", "limit": int(limit)}, timeout=KLINES_TIMEOUT_SEC, retries=KLINES_RETRIES)
+        data = fapi_get(base_url, "/fapi/v1/klines", params={"symbol": symbol, "interval": "1d", "limit": int(limit)})
         if not isinstance(data, list) or len(data) < 10:
             return None
         df = pd.DataFrame(data, columns=[
@@ -234,20 +227,15 @@ def fetch_klines_intraday_cached(base_url: str, symbol: str, interval: str, star
 @st.cache_data(ttl=CACHE_LEVELS_TTL_SEC, show_spinner=False)
 def compute_levels_all(base_url: str, symbols: List[str], fetch_days: int, threads: int) -> pd.DataFrame:
     out_rows = []
-    runtime_budget = max(5, int(MAX_LEVELS_RUNTIME_SEC))
-    started = time.monotonic()
+    threads = max(1, int(threads))
 
-    for sym in symbols:
-        if time.monotonic() - started > runtime_budget:
-            break
-
+    def worker(sym: str):
         df = fetch_klines_1d(base_url, sym, limit=max(fetch_days, 182))
         if df is None or df.empty:
-            continue
-
+            return None
         df2 = df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
         if len(df2) < 10:
-            continue
+            return None
 
         h90 = l90 = h180 = l180 = np.nan
         if len(df2) >= 90:
@@ -259,14 +247,14 @@ def compute_levels_all(base_url: str, symbols: List[str], fetch_days: int, threa
             h180 = float(np.max(w["high"].values))
             l180 = float(np.min(w["low"].values))
 
-        out_rows.append({
-            "symbol": sym,
-            "high_90": h90,
-            "low_90": l90,
-            "high_180": h180,
-            "low_180": l180,
-            "hist_days": int(len(df2)),
-        })
+        return {"symbol": sym, "high_90": h90, "low_90": l90, "high_180": h180, "low_180": l180, "hist_days": int(len(df2))}
+
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = {ex.submit(worker, s): s for s in symbols}
+        for fut in as_completed(futs):
+            row = fut.result()
+            if row:
+                out_rows.append(row)
 
     df_out = pd.DataFrame(out_rows, columns=["symbol", "high_90", "low_90", "high_180", "low_180", "hist_days"])
     return df_out.sort_values("symbol").reset_index(drop=True) if not df_out.empty else df_out
@@ -414,8 +402,7 @@ with st.sidebar:
     base_url = (base_url_input or DEFAULT_BASE_URL).rstrip("/")
 
     st.number_input("HTTP timeout (sec)", min_value=3, max_value=60, value=HTTP_TIMEOUT, step=1, key="http_timeout")
-    enable_auto_refresh = st.checkbox("Enable auto refresh", value=REFRESH_SECONDS > 0)
-    refresh_seconds = st.slider("Auto refresh (seconds)", min_value=10, max_value=300, value=max(10, REFRESH_SECONDS if REFRESH_SECONDS > 0 else 30), step=5, disabled=not enable_auto_refresh)
+    refresh_seconds = st.slider("Auto refresh (seconds)", min_value=2, max_value=60, value=REFRESH_SECONDS, step=1)
     price_source = st.selectbox("Live price source", options=["MARK_PRICE", "LAST_24H"], index=0)
 
     st.markdown("## Universe filters")
@@ -432,14 +419,13 @@ with st.sidebar:
 
     quote_assets_sel = st.multiselect("Quote assets", quote_assets_all, default=default_quotes)
     min_qv = st.number_input("Min 24h quote volume (USDT)", min_value=0.0, value=float(MIN_QUOTE_VOL_24H_ENV), step=10_000_000.0)
-    max_symbols_ui = st.slider("Max symbols to scan", min_value=10, max_value=200, value=int(LEVELS_MAX_SYMBOLS), step=10)
     buffer_pct = st.number_input("Breakout buffer (%)", min_value=0.0, max_value=5.0, value=float(BREAKOUT_BUFFER_PCT_ENV), step=0.01, format="%.2f")
 
     st.markdown("## Table view")
     show_only_breakouts = st.checkbox("Show only breakouts", value=True)
     show_90 = st.checkbox("Show 90D columns", value=True)
     show_180 = st.checkbox("Show 180D columns", value=True)
-    show_times = st.checkbox("Show breakout timestamps + recency (slower)", value=False)
+    show_times = st.checkbox("Show breakout timestamps + recency", value=True)
 
     st.markdown("## Recent breakouts")
     recent_hours = st.slider("Recent breakout window (hours)", min_value=1, max_value=168, value=int(RECENT_WINDOW_DEFAULT_HOURS), step=1)
@@ -452,21 +438,13 @@ with st.sidebar:
         index=["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"].index(BREAKOUT_TIME_INTERVAL)
         if BREAKOUT_TIME_INTERVAL in ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"] else 3,
     )
-    intraday_lookback = st.slider("Intraday lookback (hours)", min_value=24, max_value=240, value=min(int(BREAKOUT_TIME_LOOKBACK_HOURS), 48), step=24)
+    intraday_lookback = st.slider("Intraday lookback (hours)", min_value=24, max_value=720, value=int(BREAKOUT_TIME_LOOKBACK_HOURS), step=24)
 
-if enable_auto_refresh:
-    effective_refresh_seconds = int(refresh_seconds)
-    if effective_refresh_seconds < MIN_REFRESH_WITH_TIMES_SEC:
-        effective_refresh_seconds = MIN_REFRESH_WITH_TIMES_SEC
-        st.info(
-            f"Auto refresh increased to {effective_refresh_seconds}s to prevent reruns from interrupting heavy fetches."
-        )
-
-    try:
-        from streamlit_autorefresh import st_autorefresh  # type: ignore
-        st_autorefresh(interval=effective_refresh_seconds * 1000, key="auto_refresh")
-    except Exception:
-        pass
+try:
+    from streamlit_autorefresh import st_autorefresh  # type: ignore
+    st_autorefresh(interval=int(refresh_seconds) * 1000, key="auto_refresh")
+except Exception:
+    pass
 
 syms_df = df_syms[df_syms["quoteAsset"].isin(quote_assets_sel)].copy()
 symbols = syms_df["symbol"].tolist()
@@ -511,25 +489,11 @@ if min_qv > 0:
 
 symbols = snap["symbol"].tolist()
 
-levels_cap = int(max_symbols_ui) if "max_symbols_ui" in locals() else LEVELS_MAX_SYMBOLS
-if levels_cap > 0 and len(symbols) > levels_cap:
-    st.warning(
-        f"Universe capped to top {levels_cap} symbols by 24h quote volume for speed. "
-        "Increase Max symbols to scan if needed."
-    )
-    snap = snap.sort_values(["quoteVolume", "symbol"], ascending=[False, True]).head(levels_cap).copy()
-    symbols = snap["symbol"].tolist()
-
 if snap.empty:
     st.warning("No symbols matched the current filters (quote assets / volume), or Binance returned an empty snapshot.")
     st.stop()
 
 levels_df = compute_levels_all(base_url, symbols, fetch_days=LEVELS_FETCH_DAYS, threads=LEVELS_THREADS)
-if len(levels_df) < len(symbols):
-    st.warning(
-        f"Loaded levels for {len(levels_df)}/{len(symbols)} symbols this run. "
-        "Increase Max symbols/runtime only if needed."
-    )
 
 df = snap.merge(levels_df, on="symbol", how="left")
 df = df.merge(syms_df[["symbol", "baseAsset", "quoteAsset"]], on="symbol", how="left")
@@ -581,15 +545,7 @@ if show_times:
     else:
         cols = ["symbol", "quoteAsset", "price", "break_90_high", "break_90_low", "break_180_high", "break_180_low", "b_last_at_utc", "b_last_ago"]
         cols_existing = [c for c in cols if c in recent_df.columns]
-        recent_sort_cols = [c for c in ["b_last_ago_h", "symbol"] if c in recent_df.columns]
-        if recent_sort_cols:
-            recent_show = recent_df[cols_existing].copy() if cols_existing else recent_df.copy()
-            # Sort only by columns that exist to avoid intermittent KeyErrors from partial/cached frames.
-            if "symbol" in recent_show.columns and "b_last_ago_h" not in recent_show.columns and "b_last_ago_h" in recent_df.columns:
-                recent_show["b_last_ago_h"] = recent_df["b_last_ago_h"]
-            st.dataframe(recent_show.sort_values(recent_sort_cols, ascending=[True] * len(recent_sort_cols)), use_container_width=True)
-        else:
-            st.dataframe(recent_df[cols_existing] if cols_existing else recent_df, use_container_width=True)
+        st.dataframe(recent_df[cols_existing].sort_values(["b_last_ago_h", "symbol"], ascending=[True, True]), use_container_width=True)
 
 st.markdown("## Breakouts right now")
 
