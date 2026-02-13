@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -29,6 +30,10 @@ try:
 except Exception:
     pass
 
+APP_BUILD = "daily-breakouts-v3-2026-02-13"
+BASE_URL = os.environ.get("BINANCE_FAPI_BASE", "https://fapi.binance.com").rstrip("/")
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
+REQUESTS_PER_SEC = float(os.environ.get("REQUESTS_PER_SEC", "1.0"))
 APP_BUILD = "daily-breakouts-v2-2026-02-13"
 BASE_URL = os.environ.get("BINANCE_FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
@@ -41,6 +46,16 @@ CACHE_LEVELS_TTL_SEC = int(os.environ.get("CACHE_LEVELS_TTL_SEC", "21600"))
 
 LEVELS_FETCH_DAYS = int(os.environ.get("LEVELS_FETCH_DAYS", "210"))
 DEFAULT_QUOTES = [x.strip().upper() for x in os.environ.get("QUOTE_ASSETS", "USDT").split(",") if x.strip()]
+DEFAULT_MAX_SYMBOLS = int(os.environ.get("LEVELS_MAX_SYMBOLS", "10"))
+DEFAULT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.00"))
+
+st.set_page_config(page_title="Binance Perp Daily 90/180D Breakouts", layout="wide")
+st.title("Binance Perp Daily 90/180D Breakouts")
+st.caption(f"Build: {APP_BUILD}")
+st.warning(
+    "This app is one-time/manual only. If you still see auto-refresh or intraday controls, you are running an old app.py."
+)
+st.caption(f"Running file: {Path(__file__).resolve()}")
 DEFAULT_MAX_SYMBOLS = int(os.environ.get("LEVELS_MAX_SYMBOLS", "20"))
 DEFAULT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.00"))
 
@@ -78,12 +93,23 @@ def get_symbols(base_url: str, timeout: int, rps: float, retries: int) -> pd.Dat
 def get_prices(base_url: str, timeout: int, rps: float, retries: int) -> pd.DataFrame:
     c = BinanceFuturesPublic(base_url=base_url, timeout=timeout, requests_per_sec=rps, retries=retries)
     rows = c.ticker_price()
+    out = []
     data = []
     for x in rows:
         sym = str(x.get("symbol", "")).upper()
         if not sym:
             continue
         try:
+            out.append({"symbol": sym, "price": float(x.get("price", "nan"))})
+        except Exception:
+            continue
+    return pd.DataFrame(out)
+
+
+@st.cache_data(ttl=CACHE_LEVELS_TTL_SEC, show_spinner=False)
+def get_levels(base_url: str, timeout: int, rps: float, retries: int, symbols: tuple[str, ...], fetch_days: int) -> pd.DataFrame:
+    c = BinanceFuturesPublic(base_url=base_url, timeout=timeout, requests_per_sec=rps, retries=retries)
+    rows = []
             data.append({"symbol": sym, "price": float(x.get("price", "nan"))})
         except Exception:
             continue
@@ -106,6 +132,7 @@ def get_levels(
         h90, l90, h180, l180, n_days = compute_levels_from_klines(kl)
         if pd.isna(h90) or pd.isna(l90):
             continue
+        rows.append(
         out.append(
             {
                 "symbol": sym,
@@ -116,11 +143,17 @@ def get_levels(
                 "n_days": n_days,
             }
         )
+    return pd.DataFrame(rows)
     return pd.DataFrame(out)
 
 
 with st.form("run_scan"):
     c1, c2, c3 = st.columns(3)
+    quotes = c1.multiselect("Quote assets", options=["USDT", "USDC", "BTC", "ETH", "BUSD"], default=DEFAULT_QUOTES or ["USDT"])
+    max_symbols = c2.slider("Max symbols", min_value=5, max_value=80, value=DEFAULT_MAX_SYMBOLS, step=5)
+    buffer_pct = c3.number_input("Breakout buffer (%)", min_value=0.0, max_value=3.0, value=DEFAULT_BUFFER_PCT, step=0.01, format="%.2f")
+    only_breakouts = st.checkbox("Show only current breakouts", value=True)
+    st.caption("Per run request budget: 2 base calls + N daily-kline calls, where N = selected symbols.")
     quotes = c1.multiselect(
         "Quote assets",
         options=["USDT", "USDC", "BTC", "ETH", "BUSD"],
@@ -148,6 +181,10 @@ if st.button("Clear results"):
 
 if run_scan:
     try:
+        with st.spinner("Scanning..."):
+            syms = get_symbols(BASE_URL, HTTP_TIMEOUT, REQUESTS_PER_SEC, RETRIES)
+            if syms.empty:
+                st.error("No perpetual symbols returned by Binance exchangeInfo.")
         with st.spinner("Fetching symbols/prices and daily levels..."):
             syms = get_symbols(BASE_URL, HTTP_TIMEOUT, REQUESTS_PER_SEC, RETRIES)
             if syms.empty:
@@ -156,6 +193,36 @@ if run_scan:
 
             qset = {q.upper() for q in quotes}
             syms = syms[syms["quoteAsset"].isin(qset)].copy() if qset else syms.copy()
+            syms = syms.sort_values("symbol").head(int(max_symbols)).copy()
+            if syms.empty:
+                st.warning("No symbols matched selected quote assets.")
+                st.stop()
+
+            prices = get_prices(BASE_URL, HTTP_TIMEOUT, REQUESTS_PER_SEC, RETRIES)
+            prices = prices[prices["symbol"].isin(syms["symbol"])].copy()
+            if prices.empty:
+                st.warning("No prices returned for selected symbols.")
+                st.stop()
+
+            levels = get_levels(
+                BASE_URL,
+                HTTP_TIMEOUT,
+                REQUESTS_PER_SEC,
+                RETRIES,
+                tuple(syms["symbol"].tolist()),
+                LEVELS_FETCH_DAYS,
+            )
+            if levels.empty:
+                st.warning("No symbols had enough completed daily candles for 90/180D levels.")
+                st.stop()
+
+            out = syms.merge(prices, on="symbol", how="inner").merge(levels, on="symbol", how="inner")
+            out = apply_breakout_flags(out, buffer_pct=float(buffer_pct))
+
+            st.session_state["scan_df"] = out
+            st.session_state["scan_ts"] = utc_now_str()
+            st.session_state["only_breakouts"] = bool(only_breakouts)
+
             if syms.empty:
                 st.warning("No symbols matched quote-asset filter.")
                 st.stop()
@@ -188,11 +255,28 @@ if run_scan:
         st.stop()
 
 if "scan_df" not in st.session_state:
+    st.info("Press 'Run one-time scan' to fetch current daily 90/180D breakouts.")
     st.info("Click **Run one-time scan** to load current daily breakouts.")
     st.stop()
 
 out = st.session_state["scan_df"].copy()
 if st.session_state.get("only_breakouts", True):
+    out = out[out["break_90_high"] | out["break_90_low"] | out["break_180_high"] | out["break_180_low"]].copy()
+
+stats = summarize_breakouts(out)
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Symbols", stats["symbols"])
+c2.metric("> 90D High", stats["break_90_high"])
+c3.metric("< 90D Low", stats["break_90_low"])
+c4.metric("> 180D High", stats["break_180_high"])
+c5.metric("< 180D Low", stats["break_180_low"])
+st.caption(f"Last scan (UTC): {st.session_state.get('scan_ts', '')}")
+
+if out.empty:
+    st.warning("No active breakouts in this scan.")
+    st.stop()
+
+cols = [
     out = out[
         out["break_90_high"]
         | out["break_90_low"]
@@ -229,6 +313,7 @@ view_cols = [
 ]
 
 st.dataframe(
+    out[cols].sort_values(
     out[view_cols].sort_values(
         ["break_180_high", "break_180_low", "break_90_high", "break_90_low", "symbol"],
         ascending=[False, False, False, False, True],
